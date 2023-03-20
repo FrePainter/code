@@ -1,9 +1,7 @@
 ## Preprocessing
 ### 1. Download dataset
-```
-wget https://datashare.ed.ac.uk/download/DS_10283_3443.zip
-https://us.openslr.org/resources/60/dev-other.tar.gz
-```
+[VCTK](https://datashare.ed.ac.uk/handle/10283/2651)  
+[LibriTTS](https://www.openslr.org/60/)
 ### 2. Preprocessing for pre-training
 ```
 INPUT_DIR=[Directory of LibriTTS]
