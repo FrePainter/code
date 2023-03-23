@@ -4,6 +4,9 @@ import numpy as np
 import torch
 import torch.utils.data
 import glob
+import soundfile as sf
+import librosa
+import torchaudio
 
 class MelLoader(torch.utils.data.Dataset):
     def __init__(self, filelist, hps, return_name=False):
@@ -254,12 +257,8 @@ class InpaintMelAudioLoader(torch.utils.data.Dataset):
         self.max_length = hparams.max_length
         self.min_len = hparams.min_length
         self.hop_length = hparams.hop_length
-        self.ssr = os.path.basename(npz_path)
-        if self.ssr == '':
-            self.ssr = npz_path.split('/')[-2]
-
         self.npzs.sort()
-        print("Total number of npzs: {}".format(self.npzs))
+        print("Total number of npzs: {}".format(len(self.npzs)))
 
     def get_npz_path(self, npz_path):
         npzs = glob.glob(os.path.join(npz_path, '**/*.npz'), recursive=True)
@@ -271,9 +270,21 @@ class InpaintMelAudioLoader(torch.utils.data.Dataset):
         x = np.load(self.npzs[index])
         mel = torch.FloatTensor(x['mel'])
         ssr = self.npzs[index].split('/')[-3]
-        name = os.path.join(ssr, os.path.basename(self.npzs[index]).replace('.npz', '.wav'))
+        basename = os.path.basename(self.npzs[index]).replace('.npz', '.wav')
+        name = os.path.join(ssr, basename)
         mel_orig = torch.FloatTensor(x['mel_orig'])
         gt = torch.FloatTensor(x['audio_orig'])
+
+        gt_save = (gt * 32768.0).numpy().astype('int16')
+        audio_save = (x['audio'] * 32768.0).astype('int16')
+
+        gt_name = os.path.join('./logs/results/gt', basename)
+        src_name = os.path.join('./logs/results/src', ssr, basename)
+
+        os.makedirs(os.path.dirname(gt_name), exist_ok=True)
+        os.makedirs(os.path.dirname(src_name), exist_ok=True)
+        sf.write(gt_name, gt_save, samplerate=24000)
+        sf.write(src_name, audio_save, samplerate=24000)
         return mel, mel_orig, gt, name
     def __len__(self):
         return len(self.npzs)
@@ -321,3 +332,53 @@ class InpaintMelAudioCollate():
 
 
         return mel_padded, mel_lengths, orig_padded, orig_lengths, gt_padded, gt_lengths, names
+
+
+
+
+class InpaintAudioLoader(torch.utils.data.Dataset):
+    def __init__(self, file_path, output_dir, hparams, return_name=False):
+        if os.path.splitext(file_path)[1] != '':
+            self.files = [file_path]
+        else:
+            self.files = glob.glob(os.path.join(file_path, '**/*'), recursive=True)
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.return_name = return_name
+        self.max_length = hparams.max_length
+        self.min_len = hparams.min_length
+        self.hop_length = hparams.hop_length
+        self.samplerate = hparams.sampling_rate
+        self.files.sort()
+        print("Total number of files: {}".format(len(self.files)))
+
+    def __getitem__(self, index):
+        audio, sr = torchaudio.load(self.files[index])
+        audio = torchaudio.functional.resample(audio, sr, self.samplerate, resampling_method='kaiser_window').squeeze(0)
+        audio = audio / torch.abs(audio).max() * 0.95
+        basename = os.path.splitext(os.path.basename(self.files[index]))[0]
+        name = os.path.join(self.output_dir, basename+'.wav')
+
+        return torch.FloatTensor(audio), name
+    def __len__(self):
+        return len(self.files)
+
+class InpaintAudioCollate():
+    def __init__(self, hps, return_name=False, multi=False):
+        self.return_name = return_name
+        self.hop_len = hps.hop_length
+        self.max_len = hps.max_length
+
+    def __call__(self, batch):
+        audio, names = batch[0]
+        audio_segs = list(audio.split(self.hop_len * self.max_len))
+
+        audio_padded = torch.FloatTensor(len(audio_segs), self.hop_len * self.max_len)
+        audio_padded.zero_()
+        audio_lengths = [seg.size(-1) for seg in audio_segs]
+        audio_lengths = torch.LongTensor(audio_lengths)
+
+        for i, seg in enumerate(audio_segs):
+            audio_padded[i][:seg.size(-1)] = seg
+
+        return audio_padded, audio_lengths, names
