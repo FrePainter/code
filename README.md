@@ -53,7 +53,7 @@ CUDA_VISIBLE_DEVICES=0,1 python inference_for_test.py -m $FT_MODEL_NAME -d $TEST
 ## Inference 
 ```
 FT_MODEL_NAME=finetune_random
-SRC_AUDIO=[Source wav file of directory]
+SRC_AUDIO=[Source wav file or directory]
 OUTPUT_DIR=./logs/results/samples
 CUDA_VISIBLE_DEVICES=0,1 python inference_from_audio.py -m $FT_MODEL_NAME -d $SRC_AUDIO
 ```
