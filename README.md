@@ -29,7 +29,7 @@ CUDA_VISIBLE_DEVICES=0,1 python preprocess.py -i $INPUT_DIR -o $OUTPUT_DIR --sav
 ```
 PT_MODEL_NAME=pretrain_80
 MASK_RATIO=0.8
-CUDA_VISIBLE_DEVICES=0,1 python pretrain.py -m $MODEL_NAME -r $MASK_RATIO
+CUDA_VISIBLE_DEVICES=0,1 python pretrain.py -m $PT_MODEL_NAME -r $MASK_RATIO
 ```
 ## Fine-tuning
 ```
