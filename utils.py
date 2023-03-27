@@ -320,7 +320,7 @@ def get_hparams_ft(init=True):
         if args.step:
             hparams.ckpt_file = os.path.join('./logs/pretrain', args.pre_trained, 'G_{}.pth'.format(args.step))
         else:
-            hparams.ckpt_file = os.path.join('./logs/pretrain', args.pre_trained, 'G_{}.pth'.format(5))
+            hparams.ckpt_file = os.path.join('./logs/pretrain', args.pre_trained, 'G_{}.pth'.format(32))
     else:
         hparams.ckpt_file = None
     return hparams
