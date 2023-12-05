@@ -8,8 +8,8 @@ from tqdm import tqdm
 import utils
 
 from data_utils import (
-    InpaintMelAudioLoader,
-    InpaintMelAudioCollate,
+    InferenceTestLoader,
+    InferenceTestCollate,
 )
 from models_ft import (
     SynthesizerTrn,
@@ -20,6 +20,7 @@ from audio_mae import AudioMaskedAutoencoderViT
 from functools import partial
 import random
 import soundfile as sf
+from post_processing import PostProcessing
 
 torch.backends.cudnn.benchmark = True
 global_step = 0
@@ -34,36 +35,47 @@ def main(args):
 
 
     hps = utils.get_hparams_from_file(os.path.join('./logs/finetune', args.model, 'config.json'))
-    if args.step:
+
+    if args.step == 'best':
+        hps.ckpt_file = os.path.join('./logs/finetune', args.model, 'best.pth')
+        hps.step = 'best'
+    elif args.step:
         hps.ckpt_file = os.path.join('./logs/finetune', args.model, 'G_{}.pth'.format(args.step))
         hps.step = args.step
+    elif os.path.isfile(os.path.join('./logs/finetune', args.model, 'best.pth')):
+        hps.ckpt_file = os.path.join('./logs/finetune', args.model, 'best.pth')
+        hps.step = 'best'
     else:
         hps.ckpt_file = utils.latest_checkpoint_path(os.path.join('./logs/finetune', args.model), "G_*.pth")
         hps.step = os.path.basename(hps.ckpt_file).replace('G_', '').replace('.pth', '')
 
     hps.folder = os.path.join(args.model)
-    hps.step = str(args.step)
+    hps.step = str(hps.step)
     hps.dataset_path = args.dataset_path
 
-    mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+    args.output_dir = os.path.join('./logs/results', '{}_{}'.format(args.model, hps.step))
+
+    print(f'Target sampling rate: {hps.data.sampling_rate} Hz')
+    print(f'CKPT file:', hps.ckpt_file)
+
+    mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps, args))
 
 
-def run(rank, n_gpus, hps):
+def run(rank, n_gpus, hps, args):
     global global_step
 
     dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
     torch.manual_seed(hps.train.seed)
     torch.cuda.set_device(rank)
 
-    collate_fn = InpaintMelAudioCollate(hps.data, return_name=True)
+    collate_fn = InferenceTestCollate(hps.data)
 
-    eval_dataset = InpaintMelAudioLoader(hps.dataset_path, hps.data, return_name=True)
+    eval_dataset = InferenceTestLoader(args, rank)
     sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset,
                                                               num_replicas=n_gpus,
                                                               rank=rank,
                                                               shuffle=True)
-    eval_loader = DataLoader(eval_dataset, num_workers=16, shuffle=False,
-                             batch_size=1, pin_memory=True,
+    eval_loader = DataLoader(eval_dataset, num_workers=16, shuffle=False, batch_size=1,
                              drop_last=False, collate_fn=collate_fn, sampler=sampler)
     hm = hps.model_MAE
     pt_encoder = AudioMaskedAutoencoderViT(hm.num_mels, hm.mel_len, hm.patch_size, hm.in_chans,
@@ -79,45 +91,34 @@ def run(rank, n_gpus, hps):
         mask_ratio=0,
         **hps.model).cuda(rank)
 
-
-    net_g.patch_embed = pt_encoder.patch_embed
-    net_g.pos_embed = pt_encoder.pos_embed
-    net_g.cls_token = pt_encoder.cls_token
-    net_g.encoder = pt_encoder.encoder
-    net_g.pt_norm = pt_encoder.norm
-
+    utils.joint_model(net_g, pt_encoder)
     del pt_encoder
+    utils.load_checkpoint(hps.ckpt_file, net_g, None)
 
-    print(hps.ckpt_file)
-    _, _, _, epoch_str = utils.load_checkpoint(hps.ckpt_file, net_g, None)
-
-
-    global_step = 0
+    pp = PostProcessing(rank)
+    synthesize(rank, net_g, eval_loader, int(hps.data.sampling_rate), pp)
 
 
-    synthesize(rank, net_g, eval_loader, hps.folder, hps.step)
-
-
-def synthesize(rank, generator, eval_loader, tgt_folder, step):
+def synthesize(rank, generator, eval_loader, sampling_rate, pp):
     generator.eval()
     with torch.no_grad():
-        for batch_idx, (mel, mel_lengths, orig, orig_lengths, y, y_lengths, names) in enumerate(tqdm(eval_loader)):
+        for batch_idx, (mel, mel_lengths, src_audio, names) in enumerate(tqdm(eval_loader)):
             mel, mel_lengths = mel.cuda(rank), mel_lengths.cuda(rank)
-            y_lengths = y_lengths.cuda(rank)
+            src_audio = src_audio.cuda(rank)
+            audio_lengths = mel_lengths * sampling_rate / 80
 
-            y_hat = generator.infer(mel, mel_lengths, max_len=1000)
+            y_hat = generator.infer(mel, mel_lengths).squeeze(1)
 
-            y_hat = y_hat.squeeze(0).squeeze(0)
-            y_hat = y_hat[:y_lengths[0]]
+            y_hat_total = torch.cat(torch.chunk(y_hat, y_hat.size(0), dim=0), dim=1)
+            y_hat_total = y_hat_total[:, :audio_lengths.sum().long()]
 
-            y_hat = y_hat / torch.abs(y_hat).max() * 0.95 * 32768.0
-            y_hat = y_hat.data.cpu().numpy().astype('int16')
+            y_hat_total = y_hat_total / torch.abs(y_hat_total).max() * 0.95
 
-            new = os.path.join('./logs/results', '{}_{}'.format(tgt_folder,step), names[0])
+            y_hat_pp = pp.post_processing(y_hat_total, src_audio.squeeze(0), length=src_audio.size(-1))
 
-            os.makedirs(os.path.dirname(new), exist_ok=True)
-            sf.write(new, y_hat, samplerate=24000)
-
+            y_hat_pp = (y_hat_pp * 32768).squeeze().cpu().numpy().astype('int16')
+            os.makedirs(os.path.dirname(names), exist_ok=True)
+            sf.write(names, y_hat_pp, samplerate=sampling_rate)
 
 
 
@@ -125,7 +126,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--model', type=str, required=True,
                         help='Model name')
-    parser.add_argument('-s', '--step', type=str, default=200000)
+    parser.add_argument('-s', '--step', type=str, default=None)
     parser.add_argument('-d', '--dataset_path', type=str, required=True)
     args = parser.parse_args()
     main(args)

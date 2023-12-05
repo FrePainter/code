@@ -7,6 +7,8 @@ import glob
 import soundfile as sf
 import librosa
 import torchaudio
+import torchaudio.transforms as T
+from scipy.signal import resample_poly
 
 class MelLoader(torch.utils.data.Dataset):
     def __init__(self, filelist, hps, return_name=False):
@@ -337,11 +339,11 @@ class InpaintMelAudioCollate():
 
 
 class InpaintAudioLoader(torch.utils.data.Dataset):
-    def __init__(self, file_path, output_dir, hparams, return_name=False):
+    def __init__(self, file_path, output_dir, hparams, ext, return_name=False):
         if os.path.splitext(file_path)[1] != '':
             self.files = [file_path]
         else:
-            self.files = glob.glob(os.path.join(file_path, '**/*'), recursive=True)
+            self.files = glob.glob(os.path.join(file_path, f'**/*.{ext}'), recursive=True)
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         self.return_name = return_name
@@ -350,14 +352,16 @@ class InpaintAudioLoader(torch.utils.data.Dataset):
         self.hop_length = hparams.hop_length
         self.samplerate = hparams.sampling_rate
         self.files.sort()
-        print("Total number of files: {}".format(len(self.files)))
 
     def __getitem__(self, index):
         audio, sr = torchaudio.load(self.files[index])
-        audio = torchaudio.functional.resample(audio, sr, self.samplerate, resampling_method='kaiser_window').squeeze(0)
+        if sr != 24000:
+            # audio = torchaudio.functional.resample(audio, sr, 24000, resampling_method='kaiser_window').squeeze(0)
+            audio = librosa.resample(audio, sr, 24000, res_type=kaiser_best)
         audio = audio / torch.abs(audio).max() * 0.95
         basename = os.path.splitext(os.path.basename(self.files[index]))[0]
-        name = os.path.join(self.output_dir, basename+'.wav')
+        tsr = self.files[index].split('/')[-2]
+        name = os.path.join(self.output_dir, tsr, basename+'.wav')
 
         return torch.FloatTensor(audio), name
     def __len__(self):
@@ -371,7 +375,7 @@ class InpaintAudioCollate():
 
     def __call__(self, batch):
         audio, names = batch[0]
-        audio_segs = list(audio.split(self.hop_len * self.max_len))
+        audio_segs = list(audio.split(self.hop_len * self.max_len, dim=-1))
 
         audio_padded = torch.FloatTensor(len(audio_segs), self.hop_len * self.max_len)
         audio_padded.zero_()
@@ -382,3 +386,51 @@ class InpaintAudioCollate():
             audio_padded[i][:seg.size(-1)] = seg
 
         return audio_padded, audio_lengths, names
+
+
+
+
+
+class InferenceTestLoader(torch.utils.data.Dataset):
+    def __init__(self, args, rank):
+        self.pts = glob.glob(os.path.join(args.dataset_path, '**/*.pt'), recursive=True)
+        self.pts = glob.glob(os.path.join(args.dataset_path, 'source_mels', '**/*.pt'), recursive=True)
+        self.src_dir = os.path.join(args.dataset_path, 'source_wavs')
+
+        if rank == 0:
+            print('# pt: ', len(self.pts))
+        self.args = args
+        # self.resampler = T.Resample(24000, 48000, resampling_method='kaiser_window')
+
+    def __getitem__(self, index):
+        mel = torch.load(self.pts[index])
+        sr, name = self.pts[index].replace('.pt', '.wav').split('/')[-2:]
+        audio = torchaudio.load(os.path.join(self.src_dir, sr, name))[0].squeeze()
+        # audio = self.resampler(audio)
+        audio = resample_poly(audio, 48000, 24000)
+        audio = torch.FloatTensor(audio).unsqueeze(0)
+        audio = audio / torch.abs(audio).max() * 0.95
+        sr, name = self.pts[index].split('/')[-2:]
+        name = os.path.join(self.args.output_dir, sr, name).replace('.pt', '.wav')
+        return mel, audio, name
+
+    def __len__(self):
+        return len(self.pts)
+
+class InferenceTestCollate():
+    def __init__(self, hps):
+        self.max_len = hps.max_length
+        pass
+
+    def __call__(self, batch):
+        mel, audio, names = batch[0]
+        mel_segs = list(mel.split(self.max_len, dim=-1))
+
+        audio = audio / torch.abs(audio).max() * 0.95
+
+
+        mel_padded = torch.zeros(len(mel_segs), mel.size(0), self.max_len)
+        for i, seg in enumerate(mel_segs):
+            mel_padded[i, :, :seg.size(-1)] = seg
+        mel_lengths = torch.LongTensor([seg.size(-1) for seg in mel_segs])
+        return mel_padded, mel_lengths, audio.unsqueeze(0), names

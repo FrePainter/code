@@ -112,10 +112,7 @@ def interpolate_pos_embed(model, checkpoint_model):
 def load_checkpoint(checkpoint_path, model, optimizer=None):
     assert os.path.isfile(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-    iteration = checkpoint_dict['iteration']
-    learning_rate = checkpoint_dict['learning_rate']
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint_dict['optimizer'])
+
     saved_state_dict = checkpoint_dict['model']
     if hasattr(model, 'module'):
         state_dict = model.module.state_dict()
@@ -132,6 +129,15 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
         model.module.load_state_dict(new_state_dict)
     else:
         model.load_state_dict(new_state_dict)
+
+    if len(checkpoint_dict.keys()) == 1:
+        return model, None, None, None
+
+    iteration = checkpoint_dict['iteration']
+    learning_rate = checkpoint_dict['learning_rate']
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint_dict['optimizer'])
+
     logger.info("Loaded checkpoint '{}' (iteration {})".format(
         checkpoint_path, iteration))
     return model, optimizer, learning_rate, iteration
@@ -184,7 +190,6 @@ def latest_checkpoint_path(dir_path, regex="G_*.pth"):
     f_list = glob.glob(os.path.join(dir_path, regex))
     f_list.sort(key=lambda f: int("".join(filter(str.isdigit, f))))
     x = f_list[-1]
-    print(x)
     return x
 
 
@@ -461,3 +466,42 @@ def get_hparams2(init=True):
     else:
         hparams.ckpt_file = None
     return hparams
+
+def joint_model(net_g, encoder):
+    net_g.patch_embed = encoder.patch_embed
+    net_g.pos_embed = encoder.pos_embed
+    net_g.cls_token = encoder.cls_token
+    net_g.encoder = encoder.encoder
+    net_g.pt_norm = encoder.norm
+
+class MelSpectrogram(torch.nn.Module):
+    def __init__(self, sample_rate, n_fft, win_length, hop_length,
+                 f_min, f_max, n_mels):
+        super(MelSpectrogram, self).__init__()
+
+        self.pad = nn.ReflectionPad2d([int((n_fft - hop_length) / 2), int((n_fft - hop_length) / 2)])
+
+        self.stft = Spectrogram(
+            n_fft=n_fft,
+            win_length=win_length,
+            hop_length=hop_length,
+            window_fn=torch.hann_window,
+            center=False)
+
+        self.mel_scale = MelScale(
+            sample_rate=sample_rate,
+            f_min=f_min,
+            f_max=f_max,
+            n_mels=n_mels,
+            n_stft=n_fft // 2 + 1,
+            norm="slaney",
+            mel_scale="slaney")
+
+    def forward(self, x):
+        x = x.clamp(min=-1., max=1.)
+        x = self.pad(x.squeeze(1))
+        spec = self.stft(x)
+        spec = torch.sqrt(spec + (1e-9))
+        mel = self.mel_scale(spec)
+        log_mel = torch.log(mel.clamp(min=1e-5))
+        return log_mel
