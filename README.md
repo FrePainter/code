@@ -50,9 +50,11 @@ FT_MODEL_NAME=finetune_random
 TESTSET_DIR=./dataset/testset
 CUDA_VISIBLE_DEVICES=0,1 python inference_for_test.py -m $FT_MODEL_NAME -d $TESTSET_DIR
 ```
-## Inference 
+## Inference with the pre-trained model
+
 ```
-FT_MODEL_NAME=finetune_random
+sh download_checkpoint.sh
+FT_MODEL_NAME=pt_rd_80_ft_un_mrv2
 SRC_AUDIO=[Source wav file or directory]
 OUTPUT_DIR=./logs/results/samples
 CUDA_VISIBLE_DEVICES=0,1 python inference_from_audio.py -m $FT_MODEL_NAME -d $SRC_AUDIO
