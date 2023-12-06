@@ -61,3 +61,4 @@ CUDA_VISIBLE_DEVICES=0,1 python inference_for_test.py -m $FT_MODEL_NAME -d $TEST
 - https://github.com/rishikksh20/AudioMAE-pytorch
 - https://github.com/jaywalnut310/vits
 - https://github.com/mindslab-ai/nuwave2
+- https://github.com/haoheliu/versatile_audio_super_resolution
