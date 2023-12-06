@@ -338,43 +338,37 @@ class InpaintMelAudioCollate():
 
 
 
-class InpaintAudioLoader(torch.utils.data.Dataset):
-    def __init__(self, file_path, output_dir, hparams, ext, return_name=False):
+class InferenceAudioLoader(torch.utils.data.Dataset):
+    def __init__(self, file_path, output_dir, ext):
         if os.path.splitext(file_path)[1] != '':
             self.files = [file_path]
         else:
             self.files = glob.glob(os.path.join(file_path, f'**/*.{ext}'), recursive=True)
+        self.files = [os.path.basename(f).replace(f'.{ext}', '.wav') for f in self.files]
         self.output_dir = output_dir
+        self.inp_dir = os.path.join(output_dir, 'inp')
+        self.src_dir = os.path.join(output_dir, 'src')
         os.makedirs(output_dir, exist_ok=True)
-        self.return_name = return_name
-        self.max_length = hparams.max_length
-        self.min_len = hparams.min_length
-        self.hop_length = hparams.hop_length
-        self.samplerate = hparams.sampling_rate
         self.files.sort()
 
     def __getitem__(self, index):
-        audio, sr = torchaudio.load(self.files[index])
-        if sr != 24000:
-            # audio = torchaudio.functional.resample(audio, sr, 24000, resampling_method='kaiser_window').squeeze(0)
-            audio = librosa.resample(audio, sr, 24000, res_type=kaiser_best)
-        audio = audio / torch.abs(audio).max() * 0.95
-        basename = os.path.splitext(os.path.basename(self.files[index]))[0]
-        tsr = self.files[index].split('/')[-2]
-        name = os.path.join(self.output_dir, tsr, basename+'.wav')
+        basename = self.files[index]
+        src_audio = torchaudio.load(os.path.join(self.src_dir, basename))[0]
+        inp_audio = torchaudio.load(os.path.join(self.inp_dir, basename))[0]
 
-        return torch.FloatTensor(audio), name
+        name = os.path.join(self.output_dir, basename)
+
+        return inp_audio, src_audio.unsqueeze(0), name
     def __len__(self):
         return len(self.files)
 
-class InpaintAudioCollate():
-    def __init__(self, hps, return_name=False, multi=False):
-        self.return_name = return_name
+class InferenceAudioCollate():
+    def __init__(self, hps):
         self.hop_len = hps.hop_length
         self.max_len = hps.max_length
 
     def __call__(self, batch):
-        audio, names = batch[0]
+        audio, src_audio, names = batch[0]
         audio_segs = list(audio.split(self.hop_len * self.max_len, dim=-1))
 
         audio_padded = torch.FloatTensor(len(audio_segs), self.hop_len * self.max_len)
@@ -385,8 +379,63 @@ class InpaintAudioCollate():
         for i, seg in enumerate(audio_segs):
             audio_padded[i][:seg.size(-1)] = seg
 
-        return audio_padded, audio_lengths, names
+        return audio_padded, audio_lengths, src_audio, names
 
+
+class InferenceAudioLoader2(torch.utils.data.Dataset):
+    def __init__(self, file_path, output_dir, ext):
+        if os.path.splitext(file_path)[1] != '':
+            self.files = [file_path]
+        else:
+            self.files = glob.glob(os.path.join(file_path, f'**/*.{ext}'), recursive=True)
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.files.sort()
+
+    def __getitem__(self, index):
+        # audio, sr = torchaudio.load(self.files[index])
+        audio, sr = librosa.load(self.files[index], sr=None)
+
+        if sr != 48000:
+            src_audio = torch.from_numpy(resample_poly(audio.squeeze(), 48000, sr)).unsqueeze(0)
+        else:
+            src_audio = audio.clone()
+        if sr != 24000:
+            # inp_audio = torch.from_numpy(librosa.resample(audio.squeeze().numpy(), sr, 24000, res_type='kaiser_best')).unsqueeze(0)
+            inp_audio = torch.from_numpy(librosa.resample(audio, sr, 24000, res_type='kaiser_best')).unsqueeze(0)
+
+        else:
+            inp_audio = audio.clone()
+
+        src_audio = src_audio / torch.abs(src_audio).max() * 0.95
+        inp_audio = inp_audio / torch.abs(inp_audio).max() * 0.95
+
+
+        basename = os.path.splitext(os.path.basename(self.files[index]))[0]
+        name = os.path.join(self.output_dir, basename+'.wav')
+
+        return inp_audio, src_audio.unsqueeze(0), name
+    def __len__(self):
+        return len(self.files)
+
+class InferenceAudioCollate2():
+    def __init__(self, hps):
+        self.hop_len = hps.hop_length
+        self.max_len = hps.max_length
+
+    def __call__(self, batch):
+        audio, src_audio, names = batch[0]
+        audio_segs = list(audio.split(self.hop_len * self.max_len, dim=-1))
+
+        audio_padded = torch.FloatTensor(len(audio_segs), self.hop_len * self.max_len)
+        audio_padded.zero_()
+        audio_lengths = [seg.size(-1) for seg in audio_segs]
+        audio_lengths = torch.LongTensor(audio_lengths)
+
+        for i, seg in enumerate(audio_segs):
+            audio_padded[i][:seg.size(-1)] = seg
+
+        return audio_padded, audio_lengths, src_audio, names
 
 
 

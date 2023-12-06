@@ -8,8 +8,8 @@ from tqdm import tqdm
 import utils
 
 from data_utils import (
-    InpaintAudioLoader,
-    InpaintAudioCollate,
+    InferenceAudioLoader,
+    InferenceAudioCollate,
 )
 from models_ft import (
     SynthesizerTrn,
@@ -21,8 +21,17 @@ from functools import partial
 import random
 import soundfile as sf
 from mel_processing import mel_spectrogram_torch
+from functools import partial
+from multiprocessing import Pool
+import glob
+import torchaudio
+from post_processing import PostProcessing
+from scipy.signal import resample_poly
+import librosa
+import numpy as np
 torch.backends.cudnn.benchmark = True
 global_step = 0
+
 
 def main(args):
     assert torch.cuda.is_available(), "CPU training is not allowed."
@@ -32,21 +41,32 @@ def main(args):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(port)
 
-
     hps = utils.get_hparams_from_file(os.path.join('./logs/finetune', args.model, 'config.json'))
-    if args.step:
+
+    if args.step == 'best':
+        hps.ckpt_file = os.path.join('./logs/finetune', args.model, 'best.pth')
+        hps.step = 'best'
+    elif args.step:
         hps.ckpt_file = os.path.join('./logs/finetune', args.model, 'G_{}.pth'.format(args.step))
         hps.step = args.step
+    elif os.path.isfile(os.path.join('./logs/finetune', args.model, 'best.pth')):
+        hps.ckpt_file = os.path.join('./logs/finetune', args.model, 'best.pth')
+        hps.step = 'best'
     else:
         hps.ckpt_file = utils.latest_checkpoint_path(os.path.join('./logs/finetune', args.model), "G_*.pth")
         hps.step = os.path.basename(hps.ckpt_file).replace('G_', '').replace('.pth', '')
 
     hps.folder = os.path.join(args.model)
-    hps.step = str(args.step)
+    hps.step = str(hps.step)
     hps.dataset_path = args.dataset_path
-    hps.output_dir = args.output_dir
 
-    mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+    hps.output_dir = args.output_dir
+    hps.ext = args.ext
+
+    print(f'Target sampling rate: {hps.data.sampling_rate} Hz')
+    print('CKPT file:', hps.ckpt_file)
+
+    mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps))
 
 
 def run(rank, n_gpus, hps):
@@ -56,9 +76,9 @@ def run(rank, n_gpus, hps):
     torch.manual_seed(hps.train.seed)
     torch.cuda.set_device(rank)
 
-    collate_fn = InpaintAudioCollate(hps.data, return_name=True)
+    collate_fn = InferenceAudioCollate(hps.data)
 
-    eval_dataset = InpaintAudioLoader(hps.dataset_path, hps.output_dir, hps.data, return_name=True)
+    eval_dataset = InferenceAudioLoader(hps.dataset_path, hps.output_dir, hps.ext)
     sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset,
                                                               num_replicas=n_gpus,
                                                               rank=rank,
@@ -80,47 +100,42 @@ def run(rank, n_gpus, hps):
         mask_ratio=0,
         **hps.model).cuda(rank)
 
+    pp = PostProcessing(rank)
 
-    net_g.patch_embed = pt_encoder.patch_embed
-    net_g.pos_embed = pt_encoder.pos_embed
-    net_g.cls_token = pt_encoder.cls_token
-    net_g.encoder = pt_encoder.encoder
-    net_g.pt_norm = pt_encoder.norm
 
+    utils.joint_model(net_g, pt_encoder)
     del pt_encoder
+    utils.load_checkpoint(hps.ckpt_file, net_g, None)
 
-    print(hps.ckpt_file)
-    _, _, _, epoch_str = utils.load_checkpoint(hps.ckpt_file, net_g, None)
-
-
-    global_step = 0
-
-    synthesize(rank, net_g, eval_loader, hps.data)
+    synthesize(rank, net_g, eval_loader, hps.data, pp)
 
 
-def synthesize(rank, generator, eval_loader, hps):
+def synthesize(rank, generator, eval_loader, hps, pp):
     generator.eval()
     with torch.no_grad():
-        for batch_idx, (audio, audio_lengths, names) in enumerate(tqdm(eval_loader)):
+        for batch_idx, (audio, audio_lengths, src_audio, names) in enumerate(tqdm(eval_loader)):
             audio_lengths = audio_lengths.cuda(rank)
-            mel = mel_spectrogram_torch(audio.cuda(rank),
-                                        n_fft=hps.filter_length,
-                                        num_mels=hps.n_mel_channels,
-                                        sampling_rate=hps.sampling_rate,
-                                        hop_size=hps.hop_length,
-                                        win_size=hps.win_length,
-                                        fmin=hps.mel_fmin, fmax=hps.mel_fmax)
+            src_audio = src_audio.cuda(rank)
 
+            mel = mel_spectrogram_torch(audio.cuda(rank),
+                                        n_fft = 2048,
+                                        num_mels = 128,
+                                        sampling_rate = 24000,
+                                        hop_size = 300,
+                                        win_size = 1200,
+                                        fmin = 20, fmax = 12000)
 
             mel_lengths = audio_lengths // hps.hop_length
-            y_hat = generator.infer(mel, mel_lengths, max_len=1000).squeeze(1)
+            y_hat = generator.infer(mel, mel_lengths).squeeze(1)
             y_hat_total = torch.cat(torch.chunk(y_hat, y_hat.size(0), dim=0), dim=1)
-            y_hat_total = y_hat_total[0,:audio_lengths.sum()]
+            y_hat_total = y_hat_total[:,:audio_lengths.sum() * 2]
+            y_hat_total = y_hat_total / torch.abs(y_hat_total).max() * 0.95
+            y_hat_pp = pp.post_processing(y_hat_total, src_audio.squeeze(0), length=src_audio.size(-1))
 
-            y_hat_total = y_hat_total / torch.abs(y_hat_total).max() * 0.95 * 32768.0
-            y_hat_total = y_hat_total.data.cpu().numpy().astype('int16')
-            sf.write(names, y_hat_total, samplerate=hps.sampling_rate)
+            y_hat_pp = (y_hat_pp * 32768).squeeze().cpu().numpy().astype('int16')
 
+            os.makedirs(os.path.dirname(names), exist_ok=True)
+            sf.write(names, y_hat_pp, samplerate=hps.sampling_rate)
 
 
 
@@ -128,8 +143,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--model', type=str, required=True,
                         help='Model name')
-    parser.add_argument('-s', '--step', type=str, default=200000)
+    parser.add_argument('-s', '--step', type=str, default=None)
     parser.add_argument('-d', '--dataset_path', type=str, required=True)
     parser.add_argument('-o', '--output_dir', default='./logs/results/samples')
+    parser.add_argument('-e', '--ext', default='wav')
     args = parser.parse_args()
     main(args)
