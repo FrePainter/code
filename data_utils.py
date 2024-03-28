@@ -336,6 +336,48 @@ class InpaintMelAudioCollate():
         return mel_padded, mel_lengths, orig_padded, orig_lengths, gt_padded, gt_lengths, names
 
 
+class InferenceAudioMelLoader(torch.utils.data.Dataset):
+    def __init__(self, file_path, output_dir, ext):
+        if os.path.splitext(file_path)[1] != '':
+            self.files = [file_path]
+        else:
+            self.files = glob.glob(os.path.join(file_path, f'*.{ext}'))
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+    def __getitem__(self, index):
+        audio, sr = librosa.load(self.files[index], sr=None)
+        if sr != 24000:
+            inp_audio = librosa.resample(audio, orig_sr=sr, target_sr=24000, res_type='kaiser_best')
+        else:
+            inp_audio = np.copy(audio)
+        if sr != 48000:
+            src_audio = resample_poly(audio, 48000, sr)
+        else:
+            src_audio = np.copy(audio)
+
+        inp_audio = inp_audio / np.abs(inp_audio).max() * 0.95
+        src_audio = src_audio / np.abs(src_audio).max() * 0.95
+
+        if len(inp_audio) * 2 > len(src_audio):
+            src_audio = np.pad(src_audio, (0, len(inp_audio)*2 - len(src_audio)))
+        elif len(inp_audio) * 2 < len(src_audio):
+            src_audio = src_audio[:len(inp_audio)]
+
+        mel = mel_spectrogram_torch(torch.FloatTensor(inp_audio).unsqueeze(0),
+                                    n_fft=2048,
+                                    num_mels=128,
+                                    sampling_rate=24000,
+                                    hop_size=300,
+                                    win_size=1200,
+                                    fmin=20, fmax=12000).squeeze()
+
+        name = os.path.join(self.output_dir, os.path.basename(self.files[index]))
+
+        return mel, torch.FloatTensor(src_audio).unsqueeze(0), name
+
+    def __len__(self):
+        return len(self.files)
 
 
 class InferenceAudioLoader(torch.utils.data.Dataset):
