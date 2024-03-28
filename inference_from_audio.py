@@ -8,8 +8,8 @@ from tqdm import tqdm
 import utils
 
 from data_utils import (
-    InferenceAudioLoader,
-    InferenceAudioCollate,
+    InferenceAudioMelLoader,
+    InferenceTestCollate,
 )
 from models_ft import (
     SynthesizerTrn,
@@ -76,9 +76,9 @@ def run(rank, n_gpus, hps):
     torch.manual_seed(hps.train.seed)
     torch.cuda.set_device(rank)
 
-    collate_fn = InferenceAudioCollate(hps.data)
+    collate_fn = InferenceTestCollate(hps.data)
 
-    eval_dataset = InferenceAudioLoader(hps.dataset_path, hps.output_dir, hps.ext)
+    eval_dataset = InferenceAudioMelLoader(hps.dataset_path, hps.output_dir, hps.ext)
     sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset,
                                                               num_replicas=n_gpus,
                                                               rank=rank,
@@ -113,23 +113,18 @@ def run(rank, n_gpus, hps):
 def synthesize(rank, generator, eval_loader, hps, pp):
     generator.eval()
     with torch.no_grad():
-        for batch_idx, (audio, audio_lengths, src_audio, names) in enumerate(tqdm(eval_loader)):
-            audio_lengths = audio_lengths.cuda(rank)
+        for batch_idx, (mel, mel_lengths, src_audio, names) in enumerate(tqdm(eval_loader)):
+            mel, mel_lengths = mel.cuda(rank), mel_lengths.cuda(rank)
             src_audio = src_audio.cuda(rank)
+            audio_lengths = mel_lengths * hps.sampling_rate / 80
 
-            mel = mel_spectrogram_torch(audio.cuda(rank),
-                                        n_fft = 2048,
-                                        num_mels = 128,
-                                        sampling_rate = 24000,
-                                        hop_size = 300,
-                                        win_size = 1200,
-                                        fmin = 20, fmax = 12000)
-
-            mel_lengths = audio_lengths // hps.hop_length
             y_hat = generator.infer(mel, mel_lengths).squeeze(1)
+
             y_hat_total = torch.cat(torch.chunk(y_hat, y_hat.size(0), dim=0), dim=1)
-            y_hat_total = y_hat_total[:,:audio_lengths.sum() * 2]
+            y_hat_total = y_hat_total[:, :audio_lengths.sum().long()]
+
             y_hat_total = y_hat_total / torch.abs(y_hat_total).max() * 0.95
+
             y_hat_pp = pp.post_processing(y_hat_total, src_audio.squeeze(0), length=src_audio.size(-1))
 
             y_hat_pp = (y_hat_pp * 32768).squeeze().cpu().numpy().astype('int16')
