@@ -9,6 +9,7 @@ import librosa
 import torchaudio
 import torchaudio.transforms as T
 from scipy.signal import resample_poly
+from mel_processing import mel_spectrogram_torch
 
 class MelLoader(torch.utils.data.Dataset):
     def __init__(self, filelist, hps, return_name=False):
