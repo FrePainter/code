@@ -361,7 +361,7 @@ class InferenceAudioMelLoader(torch.utils.data.Dataset):
         src_audio = src_audio / np.abs(src_audio).max() * 0.95
 
         if len(inp_audio) % 300 != 0:
-            inp_audio = np.pad(inp_audio, (0, 300 - (len(inp_audio)%300)), 'constant')
+            inp_audio = np.pad(inp_audio, (0, 300 - (len(inp_audio) % 300)), 'constant')
 
         if len(inp_audio) * 2 > len(src_audio):
             src_audio = np.pad(src_audio, (0, len(inp_audio)*2 - len(src_audio)))
