@@ -58,8 +58,7 @@ MODEL_NAME=pt_rd_80_ft_ub_mrv2
 DATA_DIR=[Directory or audio file]
 OUTPUT_DIR=[output directory]
 EXT=wav
-CUDA_VISIBLE_DEVICES=0,1 python inference_from_audio.py \
-  -m $MODEL_NAME -d $DATA_DIR -o $OUTPUT_DIR -e $EXT
+CUDA_VISIBLE_DEVICES=0,1 python inference_from_audio.py -m $MODEL_NAME -d $DATA_DIR -o $OUTPUT_DIR -e $EXT
 ```
 ## Referece
 - https://github.com/rishikksh20/AudioMAE-pytorch
